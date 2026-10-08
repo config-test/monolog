@@ -1,0 +1,380 @@
+version: 2.1
+
+# Translated from .github/workflows/{continuous-integration,phpstan,lint,frankenphp-e2e,zizmor}.yml
+# Single-project PHP library (monolog/monolog), Composer, PHP >= 8.1.
+# No orbs are used, so there is nothing to version-pin here.
+
+# monolog sets "lock": false in composer.json and .gitignores composer.lock, so
+# there is no lockfile to checksum. Cache keys are therefore based on
+# composer.json (which the "composer require --no-update" steps below mutate at
+# runtime, so the key correctly varies per dependency permutation). Only the
+# Composer download cache is cached, never vendor/, because the "lowest" and
+# "highest" jobs must re-resolve dependencies on every run.
+
+commands:
+  install-php-extensions:
+    description: >
+      Equivalent of shivammathur/setup-php "extensions: mongodb, redis, amqp"
+      and "ini-values: memory_limit=-1". cimg/php ships neither extension.
+    steps:
+      - run:
+          name: Install mongodb, redis and amqp PHP extensions
+          command: |
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends librabbitmq-dev libssl-dev
+            # `yes ''` accepts the interactive defaults that redis/amqp prompt for.
+            yes '' | sudo pecl install -f mongodb redis amqp
+            CONF_DIR="$(php -i | awk -F'=> ' '/^Scan this dir for additional .ini files/ {print $2}')"
+            for ext in mongodb redis amqp; do
+              echo "extension=${ext}.so" | sudo tee "${CONF_DIR}/30-${ext}.ini" > /dev/null
+            done
+            echo 'memory_limit=-1' | sudo tee "${CONF_DIR}/99-circleci.ini" > /dev/null
+            php -m
+
+  composer-install:
+    description: >
+      Equivalent of ramsey/composer-install@4.0.0 with dependency-versions
+      highest|lowest plus optional composer-options.
+    parameters:
+      dependencies:
+        type: enum
+        enum: ["highest", "lowest"]
+        default: "highest"
+      composer-options:
+        type: string
+        default: ""
+    steps:
+      - restore_cache:
+          keys:
+            - composer-v1-<< parameters.dependencies >>-{{ checksum "composer.json" }}
+            - composer-v1-<< parameters.dependencies >>-
+      - run:
+          name: Install dependencies (<< parameters.dependencies >>)
+          command: |
+            if [ "<< parameters.dependencies >>" = "lowest" ]; then
+              composer update --prefer-lowest --prefer-stable --no-interaction --no-progress << parameters.composer-options >>
+            else
+              composer update --no-interaction --no-progress << parameters.composer-options >>
+            fi
+      - save_cache:
+          key: composer-v1-<< parameters.dependencies >>-{{ checksum "composer.json" }}
+          paths:
+            - ~/.cache/composer
+
+jobs:
+  # .github/workflows/continuous-integration.yml -> job "tests"
+  tests:
+    parameters:
+      php-version:
+        type: string
+      dependencies:
+        type: enum
+        enum: ["highest", "lowest"]
+        default: "highest"
+    docker:
+      - image: cimg/php:<< parameters.php-version >>
+        environment:
+          COMPOSER_ROOT_VERSION: dev-main
+          COMPOSER_CACHE_DIR: /home/circleci/.cache/composer
+      # Replaces supercharge/mongodb-github-action (mongodb-version: 5.0)
+      - image: mongo:5.0
+      # Replaces cobot/couchdb-action (couchdb-version: 2.3.1)
+      - image: couchdb:2.3.1
+    steps:
+      - checkout
+      - install-php-extensions
+      - run:
+          name: Add require for mongodb/mongodb to make tests runnable
+          command: composer require mongodb/mongodb --dev --no-update
+      - run:
+          name: Change dependencies
+          command: composer require --no-update --no-interaction --dev elasticsearch/elasticsearch:^7
+      - composer-install:
+          dependencies: << parameters.dependencies >>
+      - run:
+          name: Run tests
+          command: |
+            mkdir -p test-results/phpunit
+            if [ "<< parameters.php-version >>" = "8.1" ]; then
+              composer exec phpunit -- \
+                --exclude-group Elasticsearch,Elastica,e2e \
+                --log-junit test-results/phpunit/results.xml
+            else
+              composer exec phpunit -- \
+                --exclude-group Elasticsearch \
+                --exclude-group Elastica \
+                --exclude-group e2e \
+                --log-junit test-results/phpunit/results.xml
+            fi
+      - store_test_results:
+          path: test-results
+      - store_artifacts:
+          path: test-results
+
+  # .github/workflows/continuous-integration.yml -> job "tests-es-7"
+  tests-es-7:
+    parameters:
+      php-version:
+        type: string
+        default: "8.1"
+      es-version:
+        type: string
+      dependencies:
+        type: enum
+        enum: ["highest", "lowest"]
+    docker:
+      - image: cimg/php:<< parameters.php-version >>
+        environment:
+          COMPOSER_ROOT_VERSION: dev-main
+          COMPOSER_CACHE_DIR: /home/circleci/.cache/composer
+      - image: docker.elastic.co/elasticsearch/elasticsearch:<< parameters.es-version >>
+        environment:
+          discovery.type: single-node
+          xpack.security.enabled: "false"
+          ES_JAVA_OPTS: -Xms256m -Xmx512m
+    steps:
+      - checkout
+      - install-php-extensions
+      - run:
+          name: Wait for Elasticsearch
+          command: |
+            for _ in $(seq 1 60); do
+              if curl -s http://127.0.0.1:9200 | grep -q '"tagline"'; then
+                echo "Elasticsearch is up"; exit 0
+              fi
+              echo "Waiting for Elasticsearch..."; sleep 2
+            done
+            echo "Elasticsearch did not come up in time"; exit 1
+      - run:
+          name: Change dependencies
+          command: composer require --no-update --no-interaction --dev "elasticsearch/elasticsearch:^<< parameters.es-version >>"
+      - composer-install:
+          dependencies: << parameters.dependencies >>
+      - run:
+          name: Run tests
+          command: |
+            mkdir -p test-results/phpunit
+            composer exec phpunit -- --group Elasticsearch,Elastica \
+              --log-junit test-results/phpunit/results.xml
+      - when:
+          condition:
+            equal: ["highest", << parameters.dependencies >>]
+          steps:
+            - run:
+                name: Run tests with psr/log 3
+                command: |
+                  mkdir -p test-results/phpunit-psr-log-3
+                  composer remove --no-update --dev graylog2/gelf-php ruflin/elastica elasticsearch/elasticsearch rollbar/rollbar
+                  composer require --no-update --no-interaction --dev ruflin/elastica:^7 elasticsearch/elasticsearch:^7
+                  composer require --no-update psr/log:^3
+                  composer update
+                  composer exec phpunit -- --group Elasticsearch,Elastica \
+                    --log-junit test-results/phpunit-psr-log-3/results.xml
+      - store_test_results:
+          path: test-results
+      - store_artifacts:
+          path: test-results
+
+  # .github/workflows/continuous-integration.yml -> job "tests-es-8"
+  tests-es-8:
+    parameters:
+      php-version:
+        type: string
+        default: "8.1"
+      es-version:
+        type: string
+      dependencies:
+        type: enum
+        enum: ["highest", "lowest"]
+    docker:
+      - image: cimg/php:<< parameters.php-version >>
+        environment:
+          COMPOSER_ROOT_VERSION: dev-main
+          COMPOSER_CACHE_DIR: /home/circleci/.cache/composer
+      - image: docker.elastic.co/elasticsearch/elasticsearch:<< parameters.es-version >>
+        environment:
+          discovery.type: single-node
+          xpack.security.enabled: "false"
+          ES_JAVA_OPTS: -Xms256m -Xmx512m
+    steps:
+      - checkout
+      - install-php-extensions
+      - run:
+          name: Wait for Elasticsearch
+          command: |
+            for _ in $(seq 1 60); do
+              if curl -s http://127.0.0.1:9200 | grep -q '"tagline"'; then
+                echo "Elasticsearch is up"; exit 0
+              fi
+              echo "Waiting for Elasticsearch..."; sleep 2
+            done
+            echo "Elasticsearch did not come up in time"; exit 1
+      - run:
+          name: Change dependencies
+          command: |
+            composer remove --no-update --dev graylog2/gelf-php ruflin/elastica elasticsearch/elasticsearch rollbar/rollbar
+            composer require --no-update --no-interaction --dev elasticsearch/elasticsearch:^8 ruflin/elastica:^8
+      - composer-install:
+          dependencies: << parameters.dependencies >>
+      - run:
+          name: Run tests
+          command: |
+            mkdir -p test-results/phpunit
+            composer exec phpunit -- --group Elasticsearch,Elastica \
+              --log-junit test-results/phpunit/results.xml
+      - store_test_results:
+          path: test-results
+      - store_artifacts:
+          path: test-results
+
+  # .github/workflows/lint.yml
+  lint:
+    parameters:
+      php-version:
+        type: string
+    docker:
+      - image: cimg/php:<< parameters.php-version >>
+    steps:
+      - checkout
+      - run:
+          name: Lint PHP files
+          command: |
+            hasErrors=0
+            for f in $(find src/ tests/ -type f -name '*.php' ! -path '*/vendor/*' ! -path '*/Fixtures/*')
+            do
+              { error="$(php -derror_reporting=-1 -ddisplay_errors=1 -l -f $f 2>&1 1>&3 3>&-)"; } 3>&1;
+              if [ "$error" != "" ]; then
+                # The here-string operator is escaped for CircleCI's v2.1 parameter syntax.
+                while IFS= read -r line; do echo "ERROR $f: $line"; done \<<< "$error"
+                hasErrors=1
+              fi
+            done
+            if [ $hasErrors -eq 1 ]; then
+              exit 1
+            fi
+
+  # .github/workflows/phpstan.yml
+  phpstan:
+    parameters:
+      php-version:
+        type: string
+    docker:
+      - image: cimg/php:<< parameters.php-version >>
+        environment:
+          COMPOSER_ROOT_VERSION: dev-main
+          COMPOSER_CACHE_DIR: /home/circleci/.cache/composer
+    steps:
+      - checkout
+      - install-php-extensions
+      - run:
+          name: Add require for mongodb/mongodb to make tests runnable
+          command: composer require mongodb/mongodb --dev --no-update
+      - composer-install:
+          dependencies: highest
+      - run:
+          name: Run PHPStan
+          command: composer phpstan
+
+  # .github/workflows/frankenphp-e2e.yml
+  # Uses the machine executor because the GitHub job needs bind mounts and a
+  # published port; neither works through setup_remote_docker.
+  frankenphp-e2e:
+    machine:
+      image: ubuntu-2404:current
+    environment:
+      COMPOSER_ROOT_VERSION: dev-main
+      COMPOSER_CACHE_DIR: /home/circleci/.cache/composer
+    steps:
+      - checkout
+      - run:
+          name: Install PHP 8.4
+          command: |
+            sudo add-apt-repository -y ppa:ondrej/php
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends \
+              php8.4-cli php8.4-xml php8.4-mbstring php8.4-curl php8.4-zip unzip
+            echo 'memory_limit=-1' | sudo tee /etc/php/8.4/cli/conf.d/99-circleci.ini > /dev/null
+            php -v
+      - run:
+          name: Install Composer 2
+          command: |
+            curl -sS https://getcomposer.org/installer | php -- \
+              --2 --install-dir=/usr/local/bin --filename=composer
+            composer --version
+      - composer-install:
+          dependencies: highest
+          composer-options: "--ignore-platform-req=ext-mongodb"
+      - run:
+          name: Start FrankenPHP
+          command: |
+            docker run -d --name monolog-frankenphp-e2e \
+              -v "$PWD":/app/source:ro \
+              -v "$PWD/tests/e2e/frankenphp/public":/app/public:ro \
+              -e SERVER_NAME=":8099" \
+              -p 8099:8099 \
+              dunglas/frankenphp:latest
+      - run:
+          name: Run FrankenPHP e2e test
+          environment:
+            MONOLOG_FRANKENPHP_E2E: "1"
+          command: |
+            mkdir -p test-results/phpunit
+            vendor/bin/phpunit --group e2e \
+              --log-junit test-results/phpunit/results.xml
+      - store_test_results:
+          path: test-results
+      - store_artifacts:
+          path: test-results
+
+  # .github/workflows/zizmor.yml
+  zizmor:
+    docker:
+      - image: cimg/python:3.12
+    steps:
+      - checkout
+      - run:
+          name: Install zizmor
+          # TODO: pin a zizmor release here. The GitHub workflow pins the
+          # *action* (zizmorcore/zizmor-action v0.6.4), which does not map to a
+          # zizmor tool version.
+          command: pip install --quiet zizmor
+      - run:
+          name: Run zizmor
+          # --no-online-audits keeps this from needing a GitHub token.
+          command: zizmor --persona pedantic --no-online-audits .github/workflows/
+
+workflows:
+  ci:
+    jobs:
+      # PHP 8.5 from the GitHub matrix is omitted: there is no cimg/php:8.5 image.
+      - tests:
+          matrix:
+            parameters:
+              php-version: ["8.1", "8.2", "8.3", "8.4"]
+              dependencies: ["highest"]
+      - tests:
+          name: tests-8.1-lowest
+          php-version: "8.1"
+          dependencies: "lowest"
+      - tests-es-7:
+          matrix:
+            parameters:
+              es-version: ["7.0.0", "7.17.0"]
+              dependencies: ["highest", "lowest"]
+      - tests-es-8:
+          matrix:
+            parameters:
+              es-version: ["8.0.0", "8.2.0"]
+              dependencies: ["highest", "lowest"]
+      # PHP "nightly" from the GitHub lint matrix is omitted: no cimg image exists.
+      - lint:
+          matrix:
+            parameters:
+              php-version: ["8.1", "8.4"]
+      # GitHub uses "latest"; pinned to the newest cimg/php tag instead.
+      - phpstan:
+          matrix:
+            parameters:
+              php-version: ["8.1", "8.4"]
+      - frankenphp-e2e
+      - zizmor
