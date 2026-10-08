@@ -1,0 +1,49 @@
+version: 2.1
+
+jobs:
+  monolog:
+    docker:
+      - image: cimg/php:8.4
+    environment:
+      COMPOSER_ROOT_VERSION: dev-main
+    steps:
+      - checkout
+      - restore_cache:
+          keys:
+            - composer-v1-{{ checksum "composer.json" }}
+      - run:
+          name: Install dependencies
+          command: composer install --no-interaction --prefer-dist
+      - save_cache:
+          key: composer-v1-{{ checksum "composer.json" }}
+          paths:
+            - vendor
+            - ~/.composer/cache
+      - run:
+          name: Test
+          command: >
+            composer exec phpunit --
+            --exclude-group Elasticsearch
+            --exclude-group Elastica
+            --exclude-group e2e
+      - run:
+          name: Lint PHP files
+          command: |
+            hasErrors=0
+            for f in $(find src/ tests/ -type f -name '*.php' ! -path '*/vendor/*' ! -path '*/Fixtures/*')
+            do
+              if ! php -d error_reporting=-1 -d display_errors=1 -l -f "$f"; then
+                hasErrors=1
+              fi
+            done
+            if [ "$hasErrors" -eq 1 ]; then
+              exit 1
+            fi
+      - run:
+          name: PHPStan
+          command: composer phpstan
+
+workflows:
+  build:
+    jobs:
+      - monolog
