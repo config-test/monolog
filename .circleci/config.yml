@@ -1,0 +1,38 @@
+version: 2.1
+
+jobs:
+  test:
+    docker:
+      - image: cimg/php:8.4
+    environment:
+      # Composer cannot infer the root package version from CircleCI's
+      # detached-HEAD checkout, so state it explicitly.
+      COMPOSER_ROOT_VERSION: dev-main
+    steps:
+      - checkout
+
+      - restore_cache:
+          keys:
+            - composer-v1-{{ checksum "composer.json" }}
+            - composer-v1-
+
+      # The repo sets config.lock = false, so there is no composer.lock and
+      # dependencies are resolved from composer.json on every run.
+      # ext-mongodb is not in the image; the tests that need it skip themselves.
+      - run:
+          name: Install dependencies
+          command: composer update --prefer-dist --no-progress --no-interaction --ignore-platform-req=ext-mongodb
+
+      - run:
+          name: Run tests
+          command: composer exec phpunit -- --exclude-group Elasticsearch,Elastica,e2e
+
+      - save_cache:
+          key: composer-v1-{{ checksum "composer.json" }}
+          paths:
+            - ~/.cache/composer
+
+workflows:
+  ci:
+    jobs:
+      - test
