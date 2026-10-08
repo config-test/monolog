@@ -1,0 +1,56 @@
+version: 2.1
+
+jobs:
+  monolog:
+    docker:
+      - image: cimg/php:8.4
+    environment:
+      COMPOSER_ROOT_VERSION: dev-main
+    steps:
+      - checkout
+
+      - restore_cache:
+          keys:
+            - composer-v1-{{ checksum "composer.json" }}
+            - composer-v1-
+
+      # monolog has no composer.lock (composer.json sets "lock": false), so
+      # dependencies are always resolved fresh and only the downloads are cached.
+      # ext-mongodb is not in the image; the mongodb tests skip themselves via
+      # #[RequiresPhpExtension('mongodb')].
+      - run:
+          name: Install dependencies
+          command: composer install --no-interaction --prefer-dist --ignore-platform-req=ext-mongodb
+
+      - save_cache:
+          key: composer-v1-{{ checksum "composer.json" }}
+          paths:
+            - ~/.cache/composer
+
+      # Same exclusions as .github/workflows/continuous-integration.yml: those
+      # groups need Elasticsearch / a FrankenPHP container to be running.
+      - run:
+          name: Test (phpunit)
+          command: vendor/bin/phpunit --exclude-group Elasticsearch --exclude-group Elastica --exclude-group e2e
+
+      - run:
+          name: Static analysis (phpstan)
+          command: composer phpstan
+
+      - run:
+          name: Lint (php -l)
+          command: |
+            hasErrors=0
+            for f in $(find src/ tests/ -type f -name '*.php' ! -path '*/vendor/*' ! -path '*/Fixtures/*'); do
+              if ! php -derror_reporting=-1 -ddisplay_errors=1 -l -f "$f" > /dev/null; then
+                hasErrors=1
+              fi
+            done
+            if [ $hasErrors -eq 1 ]; then
+              exit 1
+            fi
+
+workflows:
+  ci:
+    jobs:
+      - monolog
