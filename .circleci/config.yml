@@ -1,0 +1,46 @@
+version: 2.1
+
+# Single project: monolog/monolog (PHP library via Composer).
+# No composer.lock (gitignored; composer config lock: false) — cache keyed on composer.json.
+# No build step (library has no compile/build command).
+# Lint: composer phpstan (matches .github/workflows/phpstan.yml).
+# Tests exclude Elasticsearch/Elastica/e2e groups (same as main CI job) so the
+# pipeline passes without those services. Optional integration DBs are noted below.
+
+jobs:
+  build-and-test:
+    docker:
+      - image: cimg/php:8.4
+    environment:
+      COMPOSER_ROOT_VERSION: dev-main
+    steps:
+      - checkout
+      - restore_cache:
+          keys:
+            - v1-composer-{{ checksum "composer.json" }}
+            - v1-composer-
+      - run:
+          name: Install Composer dependencies
+          command: |
+            composer require mongodb/mongodb --dev --no-update --no-interaction
+            composer update --no-interaction --prefer-dist
+      - save_cache:
+          key: v1-composer-{{ checksum "composer.json" }}
+          paths:
+            - vendor
+            - ~/.composer/cache
+      - run:
+          name: Run tests
+          command: >
+            composer exec phpunit --
+            --exclude-group Elasticsearch
+            --exclude-group Elastica
+            --exclude-group e2e
+      - run:
+          name: Lint (PHPStan)
+          command: composer phpstan
+
+workflows:
+  main:
+    jobs:
+      - build-and-test
