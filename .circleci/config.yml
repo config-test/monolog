@@ -1,0 +1,72 @@
+version: 2.1
+
+jobs:
+  monolog:
+    docker:
+      - image: cimg/php:8.4
+    environment:
+      # Composer cannot infer the root package version from a detached-HEAD
+      # checkout; the GitHub workflows set this for the same reason.
+      COMPOSER_ROOT_VERSION: dev-main
+    steps:
+      - checkout
+
+      - run:
+          name: Install PHP extensions
+          # install-php-extensions ships in cimg/php. ext-mongodb is required:
+          # mongodb/mongodb is a dev dependency and MongoDBHandlerTest
+          # instantiates MongoDB\Driver\Manager directly. redis and amqp match
+          # the extension list the GitHub workflows install; without them those
+          # handler tests skip instead of running.
+          command: sudo install-php-extensions mongodb redis amqp
+
+      - restore_cache:
+          keys:
+            # This repo sets "lock": false in composer.json, so there is no
+            # composer.lock to key on. composer.json is the next best thing.
+            - composer-v1-{{ checksum "composer.json" }}
+            - composer-v1-
+
+      - run:
+          name: Install dependencies
+          command: composer install --no-interaction --prefer-dist --no-progress
+
+      - save_cache:
+          key: composer-v1-{{ checksum "composer.json" }}
+          paths:
+            - ~/.cache/composer
+            - ~/.composer/cache
+
+      # No build step: Monolog is a library with no compile or asset pipeline.
+
+      - run:
+          name: Tests
+          # Elasticsearch and Elastica need a live ES server; e2e needs a
+          # FrankenPHP server. The GitHub workflows exclude the same groups
+          # from their main test job.
+          command: composer exec phpunit -- --exclude-group Elasticsearch --exclude-group Elastica --exclude-group e2e
+
+      - run:
+          name: Lint PHP files
+          command: |
+            hasErrors=0
+            for f in $(find src/ tests/ -type f -name '*.php' ! -path '*/vendor/*' ! -path '*/Fixtures/*')
+            do
+              { error="$(php -derror_reporting=-1 -ddisplay_errors=1 -l -f $f 2>&1 1>&3 3>&-)"; } 3>&1;
+              if [ "$error" != "" ]; then
+                echo "$f: $error"
+                hasErrors=1
+              fi
+            done
+            if [ $hasErrors -eq 1 ]; then
+              exit 1
+            fi
+
+      - run:
+          name: PHPStan
+          command: composer phpstan
+
+workflows:
+  ci:
+    jobs:
+      - monolog
