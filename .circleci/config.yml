@@ -1,0 +1,54 @@
+version: 2.1
+
+jobs:
+  monolog:
+    docker:
+      - image: cimg/php:8.5
+    environment:
+      COMPOSER_ROOT_VERSION: dev-main
+      COMPOSER_CACHE_DIR: /home/circleci/.cache/composer
+    steps:
+      - checkout
+      # This library disables Composer lockfiles; cache downloads, not vendor/.
+      - restore_cache:
+          keys:
+            - composer-v1-php8.5-{{ checksum "composer.json" }}
+      - run:
+          name: Install dependencies
+          # Match CI's PHP 8.5 compatibility flag. MongoDB is optional and its
+          # extension-dependent tests skip when the extension is unavailable.
+          command: composer install --no-interaction --prefer-dist --no-progress --ignore-platform-req=php+ --ignore-platform-req=ext-mongodb
+      - save_cache:
+          key: composer-v1-php8.5-{{ checksum "composer.json" }}
+          paths:
+            - /home/circleci/.cache/composer
+      # No build command is defined for this library.
+      - run:
+          name: Run tests
+          # Use the existing CI suite; Elasticsearch and FrankenPHP require
+          # dedicated integration services. Unavailable CouchDB tests skip.
+          command: |
+            # Match the PHP defaults assumed by the error-handler tests,
+            # including subprocesses spawned by PHPUnit.
+            printf '%s\n' 'zend.exception_ignore_args = On' 'error_reporting = E_ALL & ~E_DEPRECATED & ~E_USER_DEPRECATED' | sudo tee /etc/php.d/monolog-tests.ini
+            composer exec phpunit -- --exclude-group Elasticsearch --exclude-group Elastica --exclude-group e2e
+      - run:
+          name: Lint PHP files
+          command: |
+            hasErrors=0
+            for f in $(find src/ tests/ -type f -name '*.php' ! -path '*/vendor/*' ! -path '*/Fixtures/*')
+            do
+              { error="$(php -derror_reporting=-1 -ddisplay_errors=1 -l -f $f 2>&1 1>&3 3>&-)"; } 3>&1;
+              if [ "$error" != "" ]; then
+                while IFS= read -r line; do echo "::error file=$f::$line"; done \<<< "$error"
+                hasErrors=1
+              fi
+            done
+            if [ $hasErrors -eq 1 ]; then
+              exit 1
+            fi
+
+workflows:
+  starter:
+    jobs:
+      - monolog
